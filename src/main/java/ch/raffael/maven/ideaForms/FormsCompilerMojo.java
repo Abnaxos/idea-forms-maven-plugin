@@ -14,10 +14,11 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-import com.intellij.ant.*;
+import com.intellij.ant.AntClassWriter;
 import com.intellij.uiDesigner.compiler.AlienFormFileException;
 import com.intellij.uiDesigner.compiler.AsmCodeGenerator;
 import com.intellij.uiDesigner.compiler.FormErrorInfo;
+import com.intellij.uiDesigner.compiler.NestedFormLoader;
 import com.intellij.uiDesigner.compiler.Utils;
 import com.intellij.uiDesigner.lw.CompiledClassPropertiesProvider;
 import com.intellij.uiDesigner.lw.LwRootContainer;
@@ -28,7 +29,6 @@ import org.apache.maven.plugin.MojoFailureException;
 import org.apache.maven.project.MavenProject;
 import org.codehaus.plexus.util.DirectoryScanner;
 import org.codehaus.plexus.util.FileUtils;
-import org.objectweb.asm.ClassAdapter;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Opcodes;
@@ -39,6 +39,7 @@ import org.objectweb.asm.commons.EmptyVisitor;
  * @goal compile-forms
  * @phase process-classes
  * @requiresDependencyResolution compile
+ * @threadSafe true
  *
  * @author <a href="mailto:herzog@raffael.ch">Raffael Herzog</a>
  */
@@ -80,6 +81,11 @@ public class FormsCompilerMojo extends AbstractMojo {
 
     private boolean hadErrors = false;
 
+    private Map<String, File> formFiles;
+    private Map<String, LwRootContainer> formCache = new HashMap<String, LwRootContainer>();
+    private CompiledClassPropertiesProvider propertiesProvider;
+    private ClassLoader classpathClassLoader;
+
     @Override
     public void execute() throws MojoExecutionException, MojoFailureException {
         DirectoryScanner scanner = new DirectoryScanner();
@@ -89,18 +95,24 @@ public class FormsCompilerMojo extends AbstractMojo {
         scanner.scan();
         String[] includedFiles = scanner.getIncludedFiles();
         if ( includedFiles != null && includedFiles.length > 0 ) {
-            ClassLoader classpathClassLoader = null;
+            classpathClassLoader = null;
             try {
                 classpathClassLoader = buildClasspathClassLoader();
             }
             catch ( MalformedURLException e ) {
                 throw new MojoExecutionException(e.toString(), e);
             }
-            for ( String form : includedFiles ) {
-                File formFile = new File(sourceDir, form);
+            propertiesProvider = new CompiledClassPropertiesProvider(classpathClassLoader);
+            formFiles = new HashMap<String, File>(includedFiles.length);
+            for ( int i = 0; i < includedFiles.length; i++ ) {
+                formFiles.put(includedFiles[i], new File(sourceDir, includedFiles[i]));
+            }
+            for ( Map.Entry<String, File> formFileEntry:formFiles.entrySet() ) {
+                File formFile = formFileEntry.getValue();
                 getLog().debug("Processing form: " + formFile);
                 try {
-                    LwRootContainer rootContainer = Utils.getRootContainer(formFile.toURI().toURL(), new CompiledClassPropertiesProvider(classpathClassLoader));
+                    LwRootContainer rootContainer = Utils.getRootContainer(formFile.toURI().toURL(), propertiesProvider);
+                    formCache.put(formFileEntry.getKey(), rootContainer);
                     String classToBind = rootContainer.getClassToBind();
                     if ( classToBind == null ) {
                         getLog().debug("Form not bound, skipping: " + formFile);
@@ -118,7 +130,7 @@ public class FormsCompilerMojo extends AbstractMojo {
                     }
                     int classfileVersion = getClassFileVersion(classFile);
                     ClassWriter classWriter = new AntClassWriter(getAsmClassWriterFlags(classfileVersion), classpathClassLoader);
-                    AsmCodeGenerator generator = new AsmCodeGenerator(rootContainer, classpathClassLoader, null, false, classWriter);
+                    AsmCodeGenerator generator = new AsmCodeGenerator(rootContainer, classpathClassLoader, new MavenNestedFormLoader(formFile), false, classWriter);
                     generator.patchFile(classFile);
                     for ( FormErrorInfo warning : generator.getWarnings() ) {
                         getLog().warn(formFile + ":");
@@ -128,7 +140,7 @@ public class FormsCompilerMojo extends AbstractMojo {
                         error(formFile, error.getErrorMessage());
                     }
                     if ( copyFormFiles ) {
-                        File dest = new File(outputDir, form);
+                        File dest = new File(outputDir, formFileEntry.getKey());
                         getLog().debug("Copying form file " + formFile + " to " + dest);
                         FileUtils.copyFile(formFile, dest);
                     }
@@ -173,12 +185,13 @@ public class FormsCompilerMojo extends AbstractMojo {
 
     private ClassLoader buildClasspathClassLoader() throws MalformedURLException {
         List artifacts = project.getCompileArtifacts();
-        List<URL> urls = new ArrayList<URL>(artifacts.size() + 1);
+        List<URL> urls = new ArrayList<URL>(artifacts.size() + 2);
+        urls.add(sourceDir.toURI().toURL()); // needed to load nested forms
+        urls.add(outputDir.toURI().toURL());
         for ( int i = 0; i < artifacts.size(); i++ ) {
             Artifact artifact = (Artifact)artifacts.get(i);
             urls.add(artifact.getFile().toURI().toURL());
         }
-        urls.add(sourceDir.toURI().toURL()); // needed to load nested forms
         return new URLClassLoader(urls.toArray(new URL[urls.size()]), null);
     }
 
@@ -230,6 +243,50 @@ public class FormsCompilerMojo extends AbstractMojo {
             catch ( Exception e ) {
                 getLog().warn("Error closing " + String.valueOf(location));
             }
+        }
+    }
+
+    private class MavenNestedFormLoader implements NestedFormLoader {
+        private final File rootFormFile;
+        private final HashMap<String, LwRootContainer> formCache = new HashMap<String, LwRootContainer>();
+
+        public MavenNestedFormLoader(File rootFormFile) {
+            this.rootFormFile = rootFormFile;
+        }
+
+        public LwRootContainer loadForm(String formFilePath) throws Exception {
+            LwRootContainer rootContainer = formCache.get(formFilePath);
+            if ( rootContainer != null ) {
+                return rootContainer;
+            }
+            File formFile = formFiles.get(formFilePath);
+            if ( formFile != null ) {
+                rootContainer = Utils.getRootContainer(formFile.toURI().toURL(), propertiesProvider);
+            }
+            else {
+                URL url = classpathClassLoader.getResource("/" + formFilePath);
+                if ( url != null ) {
+                    rootContainer = Utils.getRootContainer(url, propertiesProvider);
+                }
+            }
+            if ( rootContainer != null ) {
+                formCache.put(formFilePath, rootContainer);
+            }
+            return rootContainer;
+        }
+
+        public String getClassToBindName(LwRootContainer container) {
+            String className = container.getClassToBind().replace('.', '/');
+            // check for inner classes
+            while ( classpathClassLoader.getResource(className + ".class") == null ) {
+                int pos = className.lastIndexOf('/');
+                if ( pos < 0 ) {
+                    error(rootFormFile, "Cannot find class to bind in nested form: " + container.getClassToBind());
+                    return container.getClassToBind();
+                }
+                className = className.substring(0, pos) + "$" + className.substring(pos + 1);
+            }
+            return className.replace('/', '.');
         }
     }
 
